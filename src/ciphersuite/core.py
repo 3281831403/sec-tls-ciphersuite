@@ -77,19 +77,26 @@ def parse_list(text: str) -> List[str]:
         if not token:
             continue
         if token == "@STRENGTH":
-            names = sorted(names, reverse=True)
+            names = order_by_strength(names)
         elif token.startswith("!"):
-            pattern = token[1:].strip().upper()
-            names = [name for name in names if not name.upper().startswith(pattern)]
+            # Exclusions are deferred until the whole string has expanded so
+            # that a later bare/plus term cannot re-add a matched suite.
+            excluded.append(token[1:].strip().upper())
         elif token.startswith("+"):
             pattern = token[1:].strip().upper()
             matched = [name for name in names if name.upper().startswith(pattern)]
             if matched:
-                names = [name for name in names if name not in matched] + sorted(matched)
+                names = [name for name in names if name not in matched] + matched
         else:
             for name in _expand(token):
                 if name not in names:
                     names.append(name)
+    if excluded:
+        names = [
+            name
+            for name in names
+            if not any(name.upper().startswith(pattern) for pattern in excluded)
+        ]
     return names
 
 
@@ -98,16 +105,7 @@ def describe(name: str) -> Dict[str, Any]:
     info = _CATALOG.get(name)
     if info is None:
         raise ValueError("unknown-suite")
-    result = dict(info)
-    if result["version"] == "TLS1.3":
-        result["kx"] = None
-    if result["enc"].endswith("-CBC"):
-        result["enc"] = result["enc"][:-4]
-    if result["mac"] is None:
-        _head, separator, tail = name.rpartition("SHA")
-        if separator:
-            result["mac"] = "SHA" + tail
-    return result
+    return dict(info)
 
 
 def _strength(info: Mapping[str, Any]) -> Tuple[int, int, int, int]:
@@ -125,9 +123,9 @@ def order_by_strength(names: Sequence[str]) -> List[str]:
 
 
 def _is_weak(name: str, info: Mapping[str, Any]) -> bool:
-    if "EXPORT" in name.upper():
+    if name.upper().startswith("EXP-"):
         return True
-    return info["enc"] in ("RC4", "3DES", "NULL")
+    return info["enc"] in ("RC4", "3DES-CBC", "NULL", "DES-CBC")
 
 
 def filter_policy(
@@ -137,7 +135,7 @@ def filter_policy(
     rules: Mapping[str, Any] = policy or {}
     minimum = rules.get("min_version")
     allow = [str(item).lower() for item in (rules.get("allow") or [])]
-    deny = [str(item) for item in (rules.get("deny") or [])]
+    deny = [str(item).lower() for item in (rules.get("deny") or [])]
     kept: List[str] = []
     for name in offered:
         info = _CATALOG.get(name)
@@ -145,12 +143,12 @@ def filter_policy(
             continue
         if _is_weak(name, info):
             continue
-        if minimum and _VERSION_RANK.get(info["version"], 0) <= _VERSION_RANK.get(str(minimum), 0):
+        if minimum and _VERSION_RANK.get(info["version"], 0) < _VERSION_RANK.get(str(minimum), 0):
             continue
         lowered = name.lower()
         if allow and not any(lowered.startswith(prefix) for prefix in allow):
             continue
-        if deny and any(name.startswith(prefix) for prefix in deny):
+        if deny and any(lowered.startswith(prefix) for prefix in deny):
             continue
         kept.append(name)
     return kept
@@ -158,4 +156,4 @@ def filter_policy(
 
 def is_forward_secret(name: str) -> bool:
     """Return whether the suite always uses an ephemeral key exchange."""
-    return describe(name)["enc"] != "NULL"
+    return describe(name)["kx"] in ("ECDHE", "TLS13")
